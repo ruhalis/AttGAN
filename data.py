@@ -41,8 +41,8 @@ class CelebA(data.Dataset):
         self.data_path = data_path
         att_list = open(attr_path, 'r', encoding='utf-8').readlines()[1].split()
         atts = [att_list.index(att) + 1 for att in selected_attrs]
-        images = np.loadtxt(attr_path, skiprows=2, usecols=[0], dtype=np.str)
-        labels = np.loadtxt(attr_path, skiprows=2, usecols=atts, dtype=np.int)
+        images = np.loadtxt(attr_path, skiprows=2, usecols=[0], dtype=str)
+        labels = np.loadtxt(attr_path, skiprows=2, usecols=atts, dtype=np.int64)
         
         if mode == 'train':
             self.images = images[:182000]
@@ -107,13 +107,20 @@ class CelebA_HQ(data.Dataset):
         return self.length
 
 def check_attribute_conflict(att_batch, att_name, att_names):
+    """Check if attribute conflicts with others."""
+    # If we only have one attribute, no conflicts possible
+    if len(att_names) == 1:
+        return att_batch
+        
     def _get(att, att_name):
-        if att_name in att_names:
-            return att[att_names.index(att_name)]
-        return None
+        if att.dim() == 1:
+            att = att.unsqueeze(1)
+        return att[:, att_names.index(att_name)]
+    
     def _set(att, value, att_name):
         if att_name in att_names:
             att[att_names.index(att_name)] = value
+    
     att_id = att_names.index(att_name)
     for att in att_batch:
         if att_name in ['Bald', 'Receding_Hairline'] and att[att_id] != 0:

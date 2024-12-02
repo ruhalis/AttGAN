@@ -1,1 +1,2 @@
 # AttGAN
+python train.py --attrs Wrinkled --data_path wrinkle_dataset/images --attr_path wrinkle_dataset/list_attr.txt --img_size 512 --shortcut_layers 1 --inject_layers 1 --mode wgan --lambda_1 100 --lambda_2 10 --lambda_3 1 --lambda_gp 10 --lr 0.0002 --epochs 200 --batch_size 32 --num_workers 4 --gpu --experiment_name experiment_001

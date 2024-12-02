@@ -18,7 +18,7 @@ MAX_DIM = 64 * 16  # 1024
 class Generator(nn.Module):
     def __init__(self, enc_dim=64, enc_layers=5, enc_norm_fn='batchnorm', enc_acti_fn='lrelu',
                  dec_dim=64, dec_layers=5, dec_norm_fn='batchnorm', dec_acti_fn='relu',
-                 n_attrs=13, shortcut_layers=1, inject_layers=0, img_size=128):
+                 n_attrs=1, shortcut_layers=1, inject_layers=0, img_size=128):
         super(Generator, self).__init__()
         self.shortcut_layers = min(shortcut_layers, dec_layers - 1)
         self.inject_layers = min(inject_layers, dec_layers - 1)
@@ -35,7 +35,7 @@ class Generator(nn.Module):
         self.enc_layers = nn.ModuleList(layers)
         
         layers = []
-        n_in = n_in + n_attrs  # 1024 + 13
+        n_in = n_in + n_attrs  # 1024 + 1
         for i in range(dec_layers):
             if i < dec_layers - 1:
                 n_out = min(dec_dim * 2**(dec_layers-i-1), MAX_DIM)
@@ -84,7 +84,6 @@ class Generator(nn.Module):
         raise Exception('Unrecognized mode: ' + mode)
 
 class Discriminators(nn.Module):
-    # No instancenorm in fcs in source code, which is different from paper.
     def __init__(self, dim=64, norm_fn='instancenorm', acti_fn='lrelu',
                  fc_dim=1024, fc_norm_fn='none', fc_acti_fn='lrelu', n_layers=5, img_size=128):
         super(Discriminators, self).__init__()
@@ -99,17 +98,30 @@ class Discriminators(nn.Module):
             )]
             n_in = n_out
         self.conv = nn.Sequential(*layers)
+        
+        # Calculate the flattened feature size
+        self.flat_size = n_in * self.f_size * self.f_size
+        
+        # Add an additional conv layer to reduce feature map size if needed
+        if self.flat_size > 16384:  # threshold can be adjusted
+            self.extra_conv = Conv2dBlock(n_in, n_in, (4, 4), stride=2, padding=1, norm_fn=norm_fn, acti_fn=acti_fn)
+            self.flat_size = n_in * (self.f_size // 2) * (self.f_size // 2)
+        else:
+            self.extra_conv = None
+        
         self.fc_adv = nn.Sequential(
-            LinearBlock(1024 * self.f_size * self.f_size, fc_dim, fc_norm_fn, fc_acti_fn),
+            LinearBlock(self.flat_size, fc_dim, fc_norm_fn, fc_acti_fn),
             LinearBlock(fc_dim, 1, 'none', 'none')
         )
         self.fc_cls = nn.Sequential(
-            LinearBlock(1024 * self.f_size * self.f_size, fc_dim, fc_norm_fn, fc_acti_fn),
-            LinearBlock(fc_dim, 13, 'none', 'none')
+            LinearBlock(self.flat_size, fc_dim, fc_norm_fn, fc_acti_fn),
+            LinearBlock(fc_dim, 1, 'none', 'none')
         )
     
     def forward(self, x):
         h = self.conv(x)
+        if self.extra_conv is not None:
+            h = self.extra_conv(h)
         h = h.view(h.size(0), -1)
         return self.fc_adv(h), self.fc_cls(h)
 
@@ -137,24 +149,24 @@ class AttGAN():
             args.dec_dim, args.dec_layers, args.dec_norm, args.dec_acti,
             args.n_attrs, args.shortcut_layers, args.inject_layers, args.img_size
         )
-        self.G.train()
-        if self.gpu: self.G.cuda()
-        summary(self.G, [(3, args.img_size, args.img_size), (args.n_attrs, 1, 1)], batch_size=4, device='cuda' if args.gpu else 'cpu')
-        
         self.D = Discriminators(
             args.dis_dim, args.dis_norm, args.dis_acti,
             args.dis_fc_dim, args.dis_fc_norm, args.dis_fc_acti, args.dis_layers, args.img_size
         )
-        self.D.train()
-        if self.gpu: self.D.cuda()
-        summary(self.D, [(3, args.img_size, args.img_size)], batch_size=4, device='cuda' if args.gpu else 'cpu')
+        
+        # Explicitly move models to GPU if available
+        if self.gpu:
+            print("Moving models to GPU...")
+            self.G.cuda()
+            self.D.cuda()
+            print("Models moved to GPU successfully!")
         
         if self.multi_gpu:
             self.G = nn.DataParallel(self.G)
             self.D = nn.DataParallel(self.D)
         
-        self.optim_G = optim.Adam(self.G.parameters(), lr=args.lr, betas=args.betas)
-        self.optim_D = optim.Adam(self.D.parameters(), lr=args.lr, betas=args.betas)
+        self.optim_G = torch.optim.Adam(self.G.parameters(), lr=args.lr, betas=args.betas)
+        self.optim_D = torch.optim.Adam(self.D.parameters(), lr=args.lr, betas=args.betas)
     
     def set_lr(self, lr):
         for g in self.optim_G.param_groups:
@@ -166,18 +178,22 @@ class AttGAN():
         for p in self.D.parameters():
             p.requires_grad = False
         
-        zs_a = self.G(img_a, mode='enc')
-        img_fake = self.G(zs_a, att_b_, mode='dec')
-        img_recon = self.G(zs_a, att_a_, mode='dec')
+        img_fake = self.G(img_a, att_b_)
+        img_recon = self.G(img_a, att_a_)
         d_fake, dc_fake = self.D(img_fake)
+        
+        # Ensure att_b has the correct shape
+        if att_b.dim() == 1:
+            att_b = att_b.unsqueeze(1)
         
         if self.mode == 'wgan':
             gf_loss = -d_fake.mean()
-        if self.mode == 'lsgan':  # mean_squared_error
+        if self.mode == 'lsgan':
             gf_loss = F.mse_loss(d_fake, torch.ones_like(d_fake))
-        if self.mode == 'dcgan':  # sigmoid_cross_entropy
+        if self.mode == 'dcgan':
             gf_loss = F.binary_cross_entropy_with_logits(d_fake, torch.ones_like(d_fake))
-        gc_loss = F.binary_cross_entropy_with_logits(dc_fake, att_b)
+        
+        gc_loss = F.binary_cross_entropy_with_logits(dc_fake, att_b.float())
         gr_loss = F.l1_loss(img_recon, img_a)
         g_loss = gf_loss + self.lambda_2 * gc_loss + self.lambda_1 * gr_loss
         
@@ -198,6 +214,10 @@ class AttGAN():
         img_fake = self.G(img_a, att_b_).detach()
         d_real, dc_real = self.D(img_a)
         d_fake, dc_fake = self.D(img_fake)
+        
+        # Ensure att_a has the correct shape
+        if att_a.dim() == 1:
+            att_a = att_a.unsqueeze(1)  # Add attribute dimension
         
         def gradient_penalty(f, real, fake=None):
             def interpolate(a, b=None):
@@ -287,10 +307,10 @@ if __name__ == '__main__':
     parser.add_argument('--img_size', dest='img_size', type=int, default=128)
     parser.add_argument('--shortcut_layers', dest='shortcut_layers', type=int, default=1)
     parser.add_argument('--inject_layers', dest='inject_layers', type=int, default=0)
-    parser.add_argument('--enc_dim', dest='enc_dim', type=int, default=64)
-    parser.add_argument('--dec_dim', dest='dec_dim', type=int, default=64)
-    parser.add_argument('--dis_dim', dest='dis_dim', type=int, default=64)
-    parser.add_argument('--dis_fc_dim', dest='dis_fc_dim', type=int, default=1024)
+    parser.add_argument('--enc_dim', dest='enc_dim', type=int, default=128)
+    parser.add_argument('--dec_dim', dest='dec_dim', type=int, default=128)
+    parser.add_argument('--dis_dim', dest='dis_dim', type=int, default=128)
+    parser.add_argument('--dis_fc_dim', dest='dis_fc_dim', type=int, default=2048)
     parser.add_argument('--enc_layers', dest='enc_layers', type=int, default=5)
     parser.add_argument('--dec_layers', dest='dec_layers', type=int, default=5)
     parser.add_argument('--dis_layers', dest='dis_layers', type=int, default=5)
@@ -312,6 +332,6 @@ if __name__ == '__main__':
     parser.add_argument('--beta2', dest='beta2', type=float, default=0.999)
     parser.add_argument('--gpu', action='store_true')
     args = parser.parse_args()
-    args.n_attrs = 13
+    args.n_attrs = 1
     args.betas = (args.beta1, args.beta2)
     attgan = AttGAN(args)
